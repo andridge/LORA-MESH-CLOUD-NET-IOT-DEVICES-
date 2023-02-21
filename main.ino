@@ -1,77 +1,106 @@
-#include <Wire.h>
-#include <DS3232RTC.h>
-#include <LowPower.h>
-#include <DHT.h>
+#include <RHRouter.h>
+#include <RHReliableDatagram.h>
+#include <RH_DHT22.h>
 #include <SPI.h>
-#include <LoRa.h>
+#include <Wire.h>
+#include <RTClib.h>
 
-#define RTC_ADDRESS 0x68
-#define DHT_PIN 2
-#define SENDER_ADDRESS 1
-#define RECEIVER_ADDRESS 2
-#define WAKEUP_INTERVAL 86400 / 5 // Wake up 5 times a day (every 5 * 86400 seconds)
+// LoRa configuration
+#define CLIENT_ADDRESS 1
+#define SERVER_ADDRESS 255
+#define ROUTER_ADDRESS 2
+#define FREQUENCY 915.0
+#define SPREADING_FACTOR 7
+#define TX_POWER 20
 
-DHT dht(DHT_PIN, DHT22);
+// DHT22 sensor configuration
+#define DHT22_PIN 2
+
+// RTC configuration
+RTC_DS3231 rtc;
+
+// LoRa objects
+RHRouter router(ROUTER_ADDRESS, SPREADING_FACTOR);
+RHReliableDatagram manager(router, CLIENT_ADDRESS);
+
+// Data buffer
+uint8_t data[5];
+
+// Sleep time
+const uint32_t SLEEP_TIME = 300000; // 5 minutes
 
 void setup() {
   Serial.begin(9600);
-  while (!Serial);
-
-  LoRa.setPins(10, 9, 2); // LoRa module CS, reset, and IRQ pins
-  if (!LoRa.begin(433E6)) {
-    Serial.println("LoRa initialization failed.");
+  if (!manager.init()) {
+    Serial.println("LoRa initialization failed");
     while (1);
   }
-
-  setSyncProvider(RTC.get); // Synchronize time with DS3232 clock
-  if (timeStatus() != timeSet) {
-    Serial.println("Unable to sync with the RTC.");
-  }
-
-  dht.begin();
+  manager.setThisAddress(CLIENT_ADDRESS);
+  router.setFrequency(FREQUENCY);
+  router.setTxPower(TX_POWER);
+  router.testNetwork();
+  rtc.begin();
+  // set initial alarm
+  rtc.setAlarm1(DateTime(rtc.now() + TimeSpan(0, 0, 30, 0)));
+  rtc.enableAlarm(rtc.MATCH_1);
+  attachInterrupt(digitalPinToInterrupt(2), wakeUp, FALLING);
 }
 
 void loop() {
-  float temperature, humidity;
+  if (digitalRead(DHT22_PIN) == HIGH) {
+    Serial.println("DHT22 sensor communication failure");
+    return;
+  }
+  float temperature = dht22.temperature();
+  float humidity = dht22.humidity();
+  data[0] = (uint8_t)(temperature);
+  data[1] = (uint8_t)(temperature * 100) % 100;
+  data[2] = (uint8_t)(humidity);
+  data[3] = (uint8_t)(humidity * 100) % 100;
+  data[4] = (uint8_t)(rtc.now().unixtime() >> 24);
+  if (manager.sendtoWait(data, sizeof(data), SERVER_ADDRESS)) {
+    Serial.println("Data sent successfully");
+  } else {
+    Serial.println("Data sending failed");
+    if (!router.routingTableHasRouteTo(SERVER_ADDRESS)) {
+      // Self-configure client address
+      uint8_t newAddress = router.getNextAvailableClientAddress();
+      if (newAddress != RH_ROUTER_BROADCAST_ADDRESS) {
+        manager.setThisAddress(newAddress);
+        CLIENT_ADDRESS = newAddress;
+        Serial.print("Self-configured client address: ");
+        Serial.println(CLIENT_ADDRESS);
+      }
+    }
+  }
+    // listen for incoming data from other nodes and forward to server node
+  if (manager.available()) {
+    // Wait for a message addressed to this node
+    uint8_t from, len;
+    if (manager.recvfromAck(data, &len, &from)) {
+      Serial.print("Received from node: ");
+      Serial.println(from);
+      if (from != CLIENT_ADDRESS && from != SERVER_ADDRESS) {
+        // Forward the message to the server node
+        if (manager.sendtoWait(data, len, SERVER_ADDRESS)) {
+          Serial.println("Data forwarded successfully");
+        } else {
+          Serial.println("Data forwarding failed");
+        }
+      }
+    }
+  }
+  router.printRoutingTable(Serial);
+  // set next alarm
+  rtc.setAlarm1(DateTime(rtc.now() + TimeSpan(0, 0, 30, 0)));
+  rtc.enableAlarm(rtc.MATCH_1);
 
-  // Calculate the next wake-up time
-  time_t now = time(nullptr);
-  time_t wakeUpTime = ((now / WAKEUP_INTERVAL) + 1) * WAKEUP_INTERVAL;
 
-  // Set the DS3232 alarm to the wake-up time
-  Wire.beginTransmission(RTC_ADDRESS);
-  Wire.write(0x07); // First alarm (A1) time and date register
-  Wire.write(0x80); // Set the alarm to activate only when the seconds match
-  Wire.write(wakeUpTime % 60); // Set the seconds alarm
-  Wire.write(0x00); // Set the minutes alarm
-  Wire.write(0x00); // Set the hours alarm
-  Wire.write(0x00); // Set the day alarm (ignored)
-  Wire.write(0x00); // Set the date alarm (ignored)
-  Wire.write(0x00); // Set the month alarm (ignored)
-  Wire.endTransmission();
+  // enter sleep mode
+  LowPower.sleep();
+}
 
-  // Sleep until the next wake-up time
-  LowPower.powerDown(SLEEP_FOREVER, ADC_OFF, BOD_OFF);
-
-  // Read the sensor data
-  temperature = dht.readTemperature();
-  humidity = dht.readHumidity();
-
-  // Send the sensor data through LoRa
-  String dataString = String(SENDER_ADDRESS) + "," + String(temperature) + "," + String(humidity);
-  LoRa.beginPacket();
-  LoRa.write(RECEIVER_ADDRESS);
-  LoRa.print(dataString);
-  LoRa.endPacket();
-
-  // Print the sensor data to the serial monitor
-  Serial.print("Temperature = ");
-  Serial.print(temperature);
-  Serial.print(" °C\t");
-  Serial.print("Humidity = ");
-  Serial.print(humidity);
-  Serial.println(" %");
-
-  // Delay for a moment to allow the data to be sent
-  delay(1000);
+void wakeUp() {
+  // clear alarm flag
+  rtc.clearAlarm(rtc.MATCH_1);
 }
